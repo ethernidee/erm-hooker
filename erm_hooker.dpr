@@ -1,12 +1,14 @@
 library Erm_Hooker;
 
 uses
-  Core,
+  SysUtils,
+
   DataLib,
+  DlgMes,
   Files,
   FilesEx,
   Lists,
-  SysUtils,
+  StrLib,
   Utils,
 
   Era;
@@ -18,9 +20,11 @@ var
 {O} Hooks: {O} TObjDict {OF THookData};
 
 const
+  MIN_HOOK_SIZE        = 5;
   MAX_HOOK_SIZE        = 16;
   DEBUG_DIR            = 'Debug\Era';
   DEBUG_ERM_HOOKS_PATH = 'Debug\Era\erm hooks.txt';
+  VERSION_STR          = '{Erm Hooker} v3.0.0';
 
   ALL_HANDLERS = 0;
 
@@ -33,19 +37,21 @@ type
     PushConst32:    byte;
     HookDataPtr:    pointer;
     PushEax:        byte;
-    PushConst32_2:  byte;
+    MovEaxConst32:  byte;
     HookHandler:    pointer;
-    Retn:           byte;
-    Padding:        array [1..3] of byte;
+    JmpEax:         word;
+    Padding:        array [1..2] of byte;
 
     procedure Init ({U} HookData: THookData; aHookHandler: pointer);
   end; // .record TBridgeCode
 
   THookData = class
-    {O} Handlers:     Lists.TList {OF ErmFunc: INTEGER};
-    {O} BridgeCode:   PBridgeCode;
-        OrigCode:     array [1..MAX_HOOK_SIZE] of byte;
-        OrigCodeSize: integer;
+    {O} Handlers:      Lists.TList {OF ErmFunc: INTEGER};
+    {O} BridgeCode:    PBridgeCode;
+    {O} AppliedPatch:  pointer; {needs RollbackAppliedPatch for deallocation}
+    {U} Addr:          pointer;
+        PatchCode:     array [0..MAX_HOOK_SIZE - 1] of byte;
+        PatchCodeSize: integer;
 
     constructor Create;
     destructor  Destroy; override;
@@ -69,24 +75,39 @@ begin
   PushConst32   := $68;
   HookDataPtr   := pointer(HookData);
   PushEax       := $50;
-  PushConst32_2 := $68;
+  MovEaxConst32 := $B8;
   HookHandler   := aHookHandler;
-  Retn          := $C3;
+  JmpEax        := $E0FF;
+end;
+
+function CanUnsetHook (HookData: THookData): boolean;
+begin
+  {!} Assert(HookData <> nil);
+  result := SysUtils.CompareMem(HookData.Addr, @HookData.PatchCode, HookData.PatchCodeSize);
+end;
+
+procedure DoUnsetHook (HookData: THookData);
+begin
+  {!} Assert(HookData <> nil);
+  RollbackAppliedPatch(HookData.AppliedPatch);
+  Hooks.DeleteItem(HookData.Addr);
 end;
 
 function OnErmCustomHook ({U} HookData: THookData; Context: PHookContext): longbool; stdcall;
 var
-  i: integer;
+  ArgXVars: Era.PErmXVars;
+  i:        integer;
 
 begin
-  result := true;
-  i      := 0;
+  ArgXVars := Era.GetArgXVars;
+  result   := true;
+  i        := 0;
 
   while i < HookData.Handlers.Count do begin
-    Era.GetArgXVars()[1] := integer(Context);
-    Era.GetArgXVars()[2] := 1;
-    FireErmEvent(integer(HookData.Handlers[i]));
-    result               := longbool(Era.GetRetXVars()[2]);
+    ArgXVars[1] := integer(Context);
+    ArgXVars[2] := integer(ord(true));
+    Era.FireErmEvent(integer(HookData.Handlers[i]));
+    result      := Era.GetRetXVars()[2] <> 0;
 
     if not result then begin
       break;
@@ -94,12 +115,13 @@ begin
 
     inc(i);
   end;
-end; // .function OnErmCustomHook
+end;
 
 function SetHook (Addr: pointer; ErmHandlerFunc: integer): longbool; stdcall;
 var
 {U} HookData:    THookData;
     NumHandlers: integer;
+    PatchSize:   integer;
     i:           integer;
 
 begin
@@ -107,14 +129,29 @@ begin
   HookData := Hooks[Addr];
   // * * * * * //
   if HookData = nil then begin
-    HookData              := THookData.Create;
-    HookData.BridgeCode   := New(PBridgeCode);
+    PatchSize := Era.CalcHookPatchSize(Addr);
+
+    for i := 1 to PatchSize - 1 do begin
+      if Hooks[Utils.PtrOfs(Addr, i)] <> nil then begin
+        Era.ShowMessage(pchar(SysUtils.Format('ErmHooker: cannot set hook at %x, because it will overwrite another ERM hook at %x', [integer(Addr), integer(Addr) + i])));
+      end;
+    end;
+
+    for i := 1 to MIN_HOOK_SIZE - 1 do begin
+      if Hooks[Utils.PtrOfs(Addr, -i)] <> nil then begin
+        Era.ShowMessage(pchar(SysUtils.Format('ErmHooker: cannot set hook at %x, because it will overwrite another ERM hook at %x', [integer(Addr), integer(Addr) - i])));
+      end;
+    end;
+
+    HookData               := THookData.Create;
+    HookData.Addr          := Addr;
+    HookData.BridgeCode    := New(PBridgeCode);
     HookData.BridgeCode.Init(HookData, @OnErmCustomHook);
-    Hooks[Addr]           := HookData;
-    HookData.OrigCodeSize := CalcHookSize(Addr);
-    Utils.CopyMem(HookData.OrigCodeSize, Addr, @HookData.OrigCode);
-    ApiHook(HookData.BridgeCode, HOOKTYPE_BRIDGE, Addr);
-  end; // .if
+    Hooks[Addr]            := HookData;
+    HookData.PatchCodeSize := Era.CalcHookPatchSize(Addr);
+    Era.HookCode(Addr, THookHandler(HookData.BridgeCode), @HookData.AppliedPatch);
+    Utils.CopyMem(HookData.PatchCodeSize, Addr, @HookData.PatchCode);
+  end;
 
   i           := 0;
   NumHandlers := HookData.Handlers.Count;
@@ -160,9 +197,8 @@ begin
       end;
     end; // .else
 
-    if HookData.Handlers.Count = 0 then begin
-      WriteAtCode(HookData.OrigCodeSize, @HookData.OrigCode, Addr);
-      Hooks.DeleteItem(Addr);
+    if (HookData.Handlers.Count = 0) and CanUnsetHook(HookData) then begin
+      DoUnsetHook(HookData);
     end;
   end; // .if
 end; // .function UnsetHook
@@ -189,21 +225,21 @@ begin
     for i := 0 to HooksAddrs.Count - 1 do begin
       Addr     := HooksAddrs[i];
       HookData := THookData(Hooks[Addr]);
-      LineStr  := Format('%s (%d) => ', [IntToHex(integer(Addr), 8), HookData.OrigCodeSize]);
+      LineStr  := SysUtils.Format('%s (%d) => ', [IntToHex(integer(Addr), 8), HookData.PatchCodeSize]);
 
       for j := 0 to HookData.Handlers.Count - 1 do begin
         if j > 0 then begin
           LineStr := LineStr + ', ';
         end;
 
-        LineStr := LineStr + SysUtils.IntToStr(integer(HookData.Handlers[j]));
-      end; // .for
+        LineStr := LineStr + Era.GetTriggerReadableName(integer(HookData.Handlers[j]));
+      end;
 
       Line(LineStr);
     end; // .for
   end; // .with
   // * * * * * //
-  FreeAndNil(HooksAddrs);
+  SysUtils.FreeAndNil(HooksAddrs);
 end; // .procedure PrintHooks
 
 procedure OnResetHooks (Event: PEvent); stdcall;
@@ -216,16 +252,46 @@ begin
   with IterateObjDict(Hooks) do begin
     while IterNext do begin
       HookData := THookData(IterValue);
-      WriteAtCode(HookData.OrigCodeSize, @HookData.OrigCode, IterKey);
+      HookData.Handlers.Clear();
+
+      if CanUnsetHook(HookData) then begin
+        DoUnsetHook(HookData);
+      end;
     end;
   end;
+end;
 
-  Hooks.Clear;
-end; // .procedure OnResetHooks
+procedure OnReportVersion (Event: PEvent); stdcall;
+begin
+  Era.ReportPluginVersion(VERSION_STR);
+end;
 
 procedure OnGenerateDebugInfo (Event: PEvent); stdcall;
 begin
   PrintHooks;
+end;
+
+procedure AssertHandler (const Mes, FileName: string; LineNumber: integer; Address: pointer);
+var
+  CrashMes: string;
+
+begin
+  CrashMes := StrLib.BuildStr
+  (
+    'Assert violation in file "~FileName~" on line ~Line~.'#13#10'Error at address: $~Address~.'#13#10'Message: "~Message~"',
+    [
+      'FileName', FileName,
+      'Line',     SysUtils.IntToStr(LineNumber),
+      'Address',  SysUtils.Format('%x', [integer(Address)]),
+      'Message',  Mes
+    ],
+    '~'
+  );
+
+  DlgMes.MsgError(CrashMes);
+
+  // Better callstack
+  pinteger(0)^ := 0;
 end;
 
 exports
@@ -234,9 +300,12 @@ exports
   PrintHooks name 'PrintHooks';
 
 begin
-  Hooks := NewObjDict(OWNS_ITEMS);
-  RegisterHandler(OnResetHooks,        'OnBeforeErmInstructions'); // Era 2.46
-  RegisterHandler(OnResetHooks,        'OnSavegameRead');          // Era 2.46
-  RegisterHandler(OnResetHooks,        'OnGameLeave');             // Era 2.47+
-  RegisterHandler(OnGenerateDebugInfo, 'OnGenerateDebugInfo');     // Era 2.47+
+  System.AssertErrorProc := AssertHandler;
+  Hooks                  := DataLib.NewObjDict(OWNS_ITEMS);
+
+  RegisterHandler(OnResetHooks,        'OnBeforeErmInstructions');
+  RegisterHandler(OnResetHooks,        'OnSavegameRead');
+  RegisterHandler(OnResetHooks,        'OnGameLeave');
+  RegisterHandler(OnGenerateDebugInfo, 'OnGenerateDebugInfo');
+  RegisterHandler(OnReportVersion,     'OnReportVersion');
 end.
