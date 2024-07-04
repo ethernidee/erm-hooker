@@ -24,7 +24,7 @@ const
   MAX_HOOK_SIZE        = 16;
   DEBUG_DIR            = 'Debug\Era';
   DEBUG_ERM_HOOKS_PATH = 'Debug\Era\erm hooks.txt';
-  VERSION_STR          = '{Erm Hooker} v3.0.0';
+  VERSION_STR          = '{Erm Hooker} v3.0.1';
 
   ALL_HANDLERS = 0;
 
@@ -205,15 +205,17 @@ end; // .function UnsetHook
 
 procedure PrintHooks; stdcall;
 var
-{O} HooksAddrs: DataLib.TList;
-{U} HookData:   THookData;
-    LineStr:    string;
-    Addr:       pointer;
-    i, j:       integer;
+{O} HooksAddrs:  DataLib.TList;
+{O} TriggerName: pchar;
+{U} HookData:    THookData;
+    LineStr:     string;
+    Addr:        pointer;
+    i, j:        integer;
 
 begin
-  HooksAddrs := GetObjDictKeys(Hooks);
-  HookData   := nil;
+  HooksAddrs  := GetObjDictKeys(Hooks);
+  HookData    := nil;
+  TriggerName := nil;
   // * * * * * //
   Files.ForcePath(DEBUG_DIR); // For manual call not in debug event
   HooksAddrs.Sort;
@@ -232,7 +234,9 @@ begin
           LineStr := LineStr + ', ';
         end;
 
-        LineStr := LineStr + Era.GetTriggerReadableName(integer(HookData.Handlers[j]));
+        TriggerName := Era.GetTriggerReadableName(integer(HookData.Handlers[j]));
+        LineStr     := LineStr + TriggerName;
+        Era.MemFree(TriggerName); TriggerName := nil;
       end;
 
       Line(LineStr);
@@ -240,6 +244,7 @@ begin
   end; // .with
   // * * * * * //
   SysUtils.FreeAndNil(HooksAddrs);
+  Era.MemFree(TriggerName);
 end; // .procedure PrintHooks
 
 procedure OnResetHooks (Event: PEvent); stdcall;
